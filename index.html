@@ -642,10 +642,11 @@ var buffers={}, soundOn=true, masterVol=0.9;
 var SND_FILES={m4a1:'v2-m4a1.mp3',k416:'v2-k416.mp3',sg552:'v2-sg552.mp3',an94:'v2-an94.mp3',m7:'v2-m7.mp3',scarh:'v2-scarh.mp3',ak12:'v2-ak12.mp3',vx9:'v2-vx9.mp3',rook7:'v2-rook7.mp3',havoc:'v2-havoc.mp3','sup-ar':'v2-sup-ar.mp3','sup-big':'v2-sup-big.mp3',dry:'v2-dry.mp3',reload:'v2-reload.mp3',rack:'v2-rack.mp3'};
 var SND_RATE={m4a1:1,k416:1.05,sg552:1,an94:1,m7:.99,scarh:.95,ak12:.96,vx9:1.06,rook7:1,havoc:1};
 var SND_GAIN={m4a1:1,k416:1,sg552:1,an94:1,m7:1.02,scarh:1.05,ak12:1,vx9:.92,rook7:1.05,havoc:1.05};
-function initAudio(){
-  if(AC){ if(AC.state==='suspended') AC.resume(); return; }
-  var Ctx=window.AudioContext||window.webkitAudioContext; if(!Ctx) return;
-  try{ AC=new Ctx(); }catch(e){ return; }
+var sndLoading={}, sndFails={}, pool={}, bypassEl=null;
+function ensureCtx(){
+  if(AC) return true;
+  var Ctx=window.AudioContext||window.webkitAudioContext; if(!Ctx) return false;
+  try{ AC=new Ctx(); }catch(e){ return false; }
   var comp=AC.createDynamicsCompressor();
   comp.threshold.value=-12; comp.ratio.value=4; comp.attack.value=0.001; comp.release.value=0.16;
   comp.connect(AC.destination);
@@ -657,12 +658,63 @@ function initAudio(){
   echoIn.connect(dly); dly.connect(damp); damp.connect(fbk); fbk.connect(dly); damp.connect(masterGain);
   noiseBuf=AC.createBuffer(1,Math.floor(AC.sampleRate*0.25),AC.sampleRate);
   var d=noiseBuf.getChannelData(0); for(var i=0;i<d.length;i++) d[i]=Math.random()*2-1;
-  Object.keys(SND_FILES).forEach(function(k){
-    fetch('assets/audio/'+SND_FILES[k]).then(function(r){ return r.arrayBuffer(); }).then(function(ab){ return AC.decodeAudioData(ab); }).then(function(buf){ buffers[k]=buf; }).catch(function(){});
-  });
+  return true;
+}
+function loadSnd(k){
+  if(buffers[k]||sndLoading[k]||(sndFails[k]||0)>=3||!AC) return;
+  sndLoading[k]=true;
+  fetch('assets/audio/'+SND_FILES[k]).then(function(r){
+    if(!r.ok) throw new Error('http '+r.status);
+    return r.arrayBuffer();
+  }).then(function(ab){
+    var done=false;
+    function ok(buf){ if(done) return; done=true; sndLoading[k]=false; if(buf) buffers[k]=buf; }
+    function bad(){ if(done) return; done=true; sndLoading[k]=false; sndFails[k]=(sndFails[k]||0)+1; setTimeout(function(){ loadSnd(k); },900); }
+    try{
+      /* callback AND promise forms: older Safari only honours the callback
+         form — promise-only decoding silently never resolves there. */
+      var p=AC.decodeAudioData(ab,ok,bad);
+      if(p&&p.catch) p.catch(function(){ bad(); });
+    }catch(e){ bad(); }
+  }).catch(function(){ sndLoading[k]=false; sndFails[k]=(sndFails[k]||0)+1; setTimeout(function(){ loadSnd(k); },900); });
+}
+function preloadAudio(){ if(!ensureCtx()) return; Object.keys(SND_FILES).forEach(loadSnd); }
+/* Fallback playback through plain media elements. iOS treats these as media
+   playback (not ambient WebAudio), so they stay audible when the phone's
+   silent switch is on and when WebAudio is still suspended/decoding. */
+function poolPlay(k,rate,gain){
+  if(!soundOn) return;
+  try{
+    var p=pool[k];
+    if(!p){ p=pool[k]=[]; for(var i=0;i<4;i++){ var a=new Audio(); a.preload='auto'; a.src='assets/audio/'+SND_FILES[k]; p.push(a); } p.i=0; }
+    var el=p[p.i++%p.length];
+    el.volume=Math.max(0,Math.min(1,masterVol*(gain==null?1:gain)));
+    try{ el.playbackRate=rate||1; }catch(e){}
+    el.currentTime=0;
+    var pr=el.play(); if(pr&&pr.catch) pr.catch(function(){});
+  }catch(e){}
+}
+/* A looping silent media element flips the iOS audio session into the
+   playback category, which un-mutes WebAudio under the silent switch. */
+function startBypass(){
+  if(bypassEl){ if(bypassEl.paused){ var bp=bypassEl.play(); if(bp&&bp.catch) bp.catch(function(){}); } return; }
+  try{
+    bypassEl=new Audio(); bypassEl.src='data:application/octet-stream;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjYyLjEyLjEwMgAAAAAAAAAAAAAA//tUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAAOAAAGAAAwMDAwMDAwQEBAQEBAQFBQUFBQUFBgYGBgYGBgcHBwcHBwcICAgICAgICQkJCQkJCQoKCgoKCgoKCwsLCwsLCwwMDAwMDAwNDQ0NDQ0NDg4ODg4ODg8PDw8PDw8P////////8AAAAATGF2YzYyLjI4AAAAAAAAAAAAAAAAJASAAAAAAAAABgDxfeZM//sUZAAP8AAAaQAAAAgAAA0gAAABAAABpAAAACAAADSAAAAETEFNRTMuMTAwVVVVVVVVVVVVVVVVVVVVVVVVVVVMQU1FMy4xMDBVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sUZB4P8AAAaQAAAAgAAA0gAAABAAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVMQU1FMy4xMDBVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sUZDwP8AAAaQAAAAgAAA0gAAABAAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVMQU1FMy4xMDBVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sUZFoP8AAAaQAAAAgAAA0gAAABAAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVMQU1FMy4xMDBVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sUZHgP8AAAaQAAAAgAAA0gAAABAAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVMQU1FMy4xMDBVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sUZJYP8AAAaQAAAAgAAA0gAAABAAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVMQU1FMy4xMDBVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sUZLQP8AAAaQAAAAgAAA0gAAABAAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sUZNIP8AAAaQAAAAgAAA0gAAABAAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sUZOGP8AAAaQAAAAgAAA0gAAABAAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sUZOGP8AAAaQAAAAgAAA0gAAABAAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sUZOGP8AAAaQAAAAgAAA0gAAABAAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sUZOGP8AAAaQAAAAgAAA0gAAABAAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sUZOGP8AAAaQAAAAgAAA0gAAABAAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sUZOGP8AAAaQAAAAgAAA0gAAABAAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV'; bypassEl.loop=true; bypassEl.volume=0.01;
+    var pr=bypassEl.play(); if(pr&&pr.catch) pr.catch(function(){});
+  }catch(e){}
+}
+function initAudio(){
+  if(!ensureCtx()) return;
+  preloadAudio();
+  if(AC.state==='suspended'){ var rp=AC.resume(); if(rp&&rp.catch) rp.catch(function(){}); }
+  /* iOS unlock: push one silent frame through the context inside the gesture */
+  try{
+    var s=AC.createBufferSource(); s.buffer=AC.createBuffer(1,1,AC.sampleRate); s.connect(masterGain); s.start(0);
+  }catch(e){}
+  startBypass();
 }
 function playBuf(buf,o){
-  if(!AC||!buf||!soundOn) return;
+  if(!AC||AC.state!=='running'||!buf||!soundOn) return;
   o=o||{};
   var src=AC.createBufferSource(); src.buffer=buf; src.playbackRate.value=o.rate||1;
   var last=src;
@@ -676,22 +728,29 @@ function isSuppressed(){ var o=SLOTS[0].options[state.build.muzzle]; return o.v=
 function playShot(){
   var id=state.weapon;
   var supp=isSuppressed();
+  var mo=SLOTS[0].options[state.build.muzzle], brake=mo.v==='brake'||mo.v==='comp';
   if(supp){
     var big=(id==='rook7'||id==='scarh'||id==='m7'||id==='havoc');
-    var sb=buffers[big?'sup-big':'sup-ar'];
-    if(sb){ playBuf(sb,{rate:(SND_RATE[id]||1)*(0.97+Math.random()*0.04),gain:.95,echo:big?0.4:0.25}); return; }
+    var sk=big?'sup-big':'sup-ar', srate=(SND_RATE[id]||1)*(0.97+Math.random()*0.04);
+    if(AC&&AC.state==='running'&&buffers[sk]){ playBuf(buffers[sk],{rate:srate,gain:.95,echo:big?0.4:0.25}); return; }
+    poolPlay(sk,srate,.95); loadSnd(sk); return;
   }
-  var buf=buffers[id]; if(!buf) return;
-  var mo=SLOTS[0].options[state.build.muzzle], brake=mo.v==='brake'||mo.v==='comp';
   var rate=(SND_RATE[id]||1)*(0.98+Math.random()*0.045)*(brake?1.015:1);
-  playBuf(buf,{rate:rate, gain:(SND_GAIN[id]||1)*(brake?1.06:1),
-    echo:(id==='rook7'||id==='scarh'||id==='havoc'||id==='m7')?0.5:0.34});
-  /* mechanical layer: a faint bolt/action tick under the blast, pitched per gun */
-  noiseHit(0.045, id==='vx9'?3400:2300, 0.10, 0.012);
+  var gain=(SND_GAIN[id]||1)*(brake?1.06:1);
+  if(AC&&AC.state==='running'&&buffers[id]){
+    playBuf(buffers[id],{rate:rate, gain:gain,
+      echo:(id==='rook7'||id==='scarh'||id==='havoc'||id==='m7')?0.5:0.34});
+    /* mechanical layer: a faint bolt/action tick under the blast, pitched per gun */
+    noiseHit(0.045, id==='vx9'?3400:2300, 0.10, 0.012);
+    return;
+  }
+  /* WebAudio not ready (still decoding, or iOS kept it suspended): the shot
+     still fires through a plain media element — never a silent shot. */
+  poolPlay(id,rate,gain); loadSnd(id);
 }
-function playDry(){ playBuf(buffers.dry,{gain:.95,rate:1+Math.random()*0.06}); }
-function playReload(){ playBuf(buffers.reload,{gain:.8,rate:1.02}); }
-function playRack(){ playBuf(buffers.rack,{gain:.6,rate:1.25}); }
+function playDry(){ var r=1+Math.random()*0.06; if(AC&&AC.state==='running'&&buffers.dry) playBuf(buffers.dry,{gain:.95,rate:r}); else { poolPlay('dry',r,.95); loadSnd('dry'); } }
+function playReload(){ if(AC&&AC.state==='running'&&buffers.reload) playBuf(buffers.reload,{gain:.8,rate:1.02}); else { poolPlay('reload',1.02,.8); loadSnd('reload'); } }
+function playRack(){ if(AC&&AC.state==='running'&&buffers.rack) playBuf(buffers.rack,{gain:.6,rate:1.25}); else { poolPlay('rack',1.25,.6); loadSnd('rack'); } }
 function noiseHit(dur,freq,gain,delay){
   if(!AC||!soundOn||!noiseBuf) return;
   var t=AC.currentTime+(delay||0);
@@ -707,14 +766,20 @@ function tone(freq,dur,gain,type,delay){
   var g=AC.createGain(); g.gain.setValueAtTime(gain,t); g.gain.exponentialRampToValueAtTime(0.001,t+dur);
   o.connect(g); g.connect(masterGain); o.start(t); o.stop(t+dur+0.02);
 }
-function playClick(){ noiseHit(0.05,2600,0.18); }
-function playClack(){ noiseHit(0.05,1700,0.26); noiseHit(0.06,950,0.22,0.055); }
+function playClick(){ if(AC&&AC.state==='running') noiseHit(0.05,2600,0.18); else poolPlay('dry',1.3,.35); }
+function playClack(){ if(AC&&AC.state==='running'){ noiseHit(0.05,1700,0.26); noiseHit(0.06,950,0.22,0.055); } else poolPlay('rack',1.5,.4); }
 var _tickT=0;
 function playTick(){ var n=performance.now(); if(n-_tickT<45) return; _tickT=n; tone(1500+Math.random()*300,0.03,0.045,'square'); }
-function playPing(){ tone(2350,0.16,0.11,'sine'); tone(3520,0.10,0.05,'sine',0.012); }
-function playBlip(){ tone(660,0.07,0.09,'triangle'); tone(990,0.09,0.09,'triangle',0.06); }
+function playPing(){ if(AC&&AC.state==='running'){ tone(2350,0.16,0.11,'sine'); tone(3520,0.10,0.05,'sine',0.012); } else poolPlay('dry',2.1,.3); }
+function playBlip(){ if(AC&&AC.state==='running'){ tone(660,0.07,0.09,'triangle'); tone(990,0.09,0.09,'triangle',0.06); } else poolPlay('dry',1.6,.3); }
 document.addEventListener('pointerdown',initAudio);
+document.addEventListener('touchend',initAudio);
+document.addEventListener('click',initAudio);
 document.addEventListener('keydown',initAudio);
+document.addEventListener('visibilitychange',function(){ if(!document.hidden) initAudio(); });
+/* Start fetching + decoding every recording right away, so the first shot
+   isn't racing the network. Playback itself unlocks on the first tap. */
+preloadAudio();
 
 /* ============ 3D — MESH-LEVEL GEOMETRY ============
    No box-assembly guns. Every major part is real shaped geometry:
@@ -891,6 +956,33 @@ function opticMesh(opt,S){
   return g;
 }
 
+function rookScopeMesh(S){
+  /* Rook-7 factory glass — the gun's DEFAULT optic (optic slot left stock).
+     A real scope, not a block: lathed tube with ocular + objective bells, zoom
+     ring, elevation + windage turrets, and flip caps closed over both lenses,
+     carried on two ring mounts bolted to the rail. Equipping any other optic
+     in the slot replaces this mesh; clearing the slot brings it back. */
+  var g=new THREE.Group(), cx=S.opticX, baseY=S.recTop+0.016;
+  var len=0.38, r=0.019, y6=baseY+0.056, x0=cx-len/2+0.01;
+  [-0.105,0.075].forEach(function(dx){ /* ring mounts down to the rail */
+    g.add(extrude([[cx+dx-0.016,baseY],[cx+dx+0.016,baseY],[cx+dx+0.013,baseY+0.040],[cx+dx-0.013,baseY+0.040]],0.026,MATS.dark));
+    g.add(latheX([[r+0.006,0],[r+0.006,0.016],[r+0.003,0.018]],MATS.steel,{x:cx+dx-0.009,y:y6}));
+  });
+  /* main tube: ocular bell -> tube -> objective bell, one lathed profile */
+  g.add(latheX([[0.012,0],[0.020,0.010],[0.0235,0.034],[0.020,0.052],[r,0.060],[r,len-0.085],[0.023,len-0.062],[0.031,len-0.030],[0.033,len-0.008],[0.028,len]],MATS.dark,{x:x0,y:y6}));
+  g.add(latheX([[0.0235,0],[0.0235,0.020]],MATS.steel,{x:x0+0.070,y:y6})); /* zoom ring */
+  var turret=new THREE.Mesh(new THREE.CylinderGeometry(0.020,0.020,0.021,18),MATS.steel); turret.position.set(cx-0.015,y6+r+0.013,0); turret.castShadow=true; g.add(turret); /* elevation */
+  var turCap=new THREE.Mesh(new THREE.CylinderGeometry(0.013,0.013,0.008,18),MATS.dark); turCap.position.set(cx-0.015,y6+r+0.027,0); turCap.castShadow=true; g.add(turCap);
+  var turret2=new THREE.Mesh(new THREE.CylinderGeometry(0.017,0.017,0.016,18),MATS.steel); turret2.rotation.x=Math.PI/2; turret2.position.set(cx+0.030,y6,r+0.006); turret2.castShadow=true; g.add(turret2); /* windage */
+  /* rear flip cap, closed over the ocular lens, hinge tab on top */
+  g.add(latheX([[0.001,0],[0.014,0.001],[0.023,0.005],[0.025,0.010],[0.025,0.024]],MATS.polymer,{x:x0-0.024,y:y6}));
+  g.add(extrude([[x0-0.020,y6+0.020],[x0-0.006,y6+0.020],[x0-0.006,y6+0.031],[x0-0.020,y6+0.031]],0.010,MATS.polymer,{bevel:false}));
+  /* front flip cap, closed over the objective lens, hinge tab on top */
+  g.add(latheX([[0.0345,0],[0.0345,0.014],[0.032,0.019],[0.014,0.023],[0.001,0.024]],MATS.polymer,{x:x0+len-0.004,y:y6}));
+  g.add(extrude([[x0+len+0.002,y6+0.027],[x0+len+0.016,y6+0.027],[x0+len+0.016,y6+0.038],[x0+len+0.002,y6+0.038]],0.010,MATS.polymer,{bevel:false}));
+  return g;
+}
+
 function stockMesh(opt,S){
   var g=new THREE.Group(), vp=opt.vp||{}, x0=S.stockX, mat=matOf(vp.mat,MATS.polymer);
   g.add(latheX([[0.020,0],[0.020,0.10],[0.017,0.105]],MATS.steel,{x:x0-0.105,y:0.008})); /* buffer tube */
@@ -928,6 +1020,9 @@ function stockMesh(opt,S){
     g.add(extrude([[X(-0.10),0.055],[X(-0.45),0.06],[X(-0.465),0.04],[X(-0.465),-0.075],[X(-0.44),-0.085],[X(-0.11),-0.065],[X(-0.095),-0.005]],0.056,matOf(vp.mat,MATS.polymer)));
     g.add(extrude([[X(-0.49),0.048],[X(-0.458),0.05],[X(-0.458),-0.08],[X(-0.49),-0.072]],0.058,MATS.rubber));
   }
+  /* per-gun stock scaling (Rook-7 only): shrink about the receiver joint so the
+     stock keeps its shape and detail at ~half size instead of dwarfing the gun */
+  if(S.stockScale&&S.stockScale!==1){ var ss=S.stockScale; g.scale.set(ss,0.68,0.82); g.position.x=x0*(1-ss); g.position.y=0.012*(1-0.68); }
   return g;
 }
 function foreGripMesh(opt,S){
@@ -1083,11 +1178,24 @@ var GUN_SPECS={
    recPts:[[-.23,.055],[.16,.055],[.225,.03],[.23,-.015],[.17,-.04],[.155,-.115],[.075,-.115],[.06,-.045],[-.03,-.048],[-.07,-.082],[-.205,-.082],[-.23,-.042]],
    hgPts:[[0,.042],[.26,.04],[.26,-.045],[0,-.05]],
    extra:function(g,S){ g.add(extrude([[0.02,0.012],[0.075,0.012],[0.075,0.032],[0.02,0.032]],0.026,MATS.dark,{z:S.recW/2+0.004})); }},
- rook7:{recL:.58,recW:.082,recTop:.048,recBot:-.040,recMat:'steel',hgL:.40,hgW:.084,hgMat:'carbon',barrelOut:.58,barrelR:.019,magTilt:-5,magLen:.17,magCurve:0,gas:'none',fluted:1,
+ rook7:{recL:.58,recW:.082,recTop:.048,recBot:-.040,recMat:'steel',hgL:.40,hgW:.084,hgMat:'carbon',barrelOut:.58,barrelR:.019,magTilt:-5,magLen:.17,magCurve:0,gas:'none',fluted:1,stockScale:.5,
    recPts:[[-.29,.048],[.22,.048],[.285,.026],[.29,-.014],[.215,-.038],[.20,-.088],[.115,-.088],[.10,-.04],[-.03,-.042],[-.08,-.072],[-.265,-.072],[-.29,-.038]],
    hgPts:[[0,.036],[.40,.032],[.40,-.04],[0,-.044]],
    extra:function(g,S){ g.add(tube([[0.015,-0.005,-0.045],[0.03,-0.02,-0.085],[0.035,-0.045,-0.10]],0.009,MATS.steel)); /* bolt handle */
-     g.add(latheX([[0.016,0],[0.016,0.012]],MATS.steelLight,{seg:14}).translateX(0)); var ball=new THREE.Mesh(new THREE.SphereGeometry(0.017,16,12),MATS.steelLight); ball.position.set(0.037,-0.052,-0.103); ball.castShadow=true; g.add(ball); }},
+     g.add(latheX([[0.016,0],[0.016,0.012]],MATS.steelLight,{seg:14}).translateX(0)); var ball=new THREE.Mesh(new THREE.SphereGeometry(0.017,16,12),MATS.steelLight); ball.position.set(0.037,-0.052,-0.103); ball.castShadow=true; g.add(ball);
+     /* flip-up backup irons at the rail ends — part of the gun, stay fitted whatever optic the slot holds */
+     g.add(extrude([[-0.270,0.056],[-0.244,0.056],[-0.248,0.092],[-0.266,0.092]],0.010,MATS.steel)); /* rear post */
+     var buisR=latheX([[0.019,0],[0.019,0.007],[0.012,0.009]],MATS.steel,{seg:20}); buisR.geometry.rotateX(Math.PI/2); buisR.position.set(-0.257,0.102,0); g.add(buisR); /* rear aperture ring */
+     g.add(extrude([[0.584,0.056],[0.608,0.056],[0.604,0.088],[0.588,0.088]],0.008,MATS.steel)); /* front post */
+     g.add(latheX([[0.004,0],[0.004,0.016]],MATS.steel,{x:0.596,y:0.086,axisY:1,seg:8})); /* front pin */
+     /* integral bipod at the handguard tip — the sniper silhouette */
+     var bx=S.bipodX;
+     g.add(extrude([[bx-0.030,S.hgBot+0.006],[bx+0.030,S.hgBot+0.006],[bx+0.024,S.hgBot-0.034],[bx-0.024,S.hgBot-0.034]],0.050,MATS.dark)); /* mount block */
+     var axle=latheX([[0.017,0],[0.017,0.058]],MATS.steel,{seg:14}); axle.geometry.rotateX(Math.PI/2); axle.position.set(bx,S.hgBot-0.027,-0.029); g.add(axle); /* pivot axle */
+     g.add(tube([[bx,S.hgBot-0.028,0.016],[bx+0.035,S.hgBot-0.19,0.095],[bx+0.052,S.hgBot-0.33,0.165]],0.0075,MATS.steel)); /* leg R */
+     g.add(tube([[bx,S.hgBot-0.028,-0.016],[bx+0.035,S.hgBot-0.19,-0.095],[bx+0.052,S.hgBot-0.33,-0.165]],0.0075,MATS.steel)); /* leg L */
+     g.add(extrude([[bx+0.034,S.hgBot-0.348],[bx+0.074,S.hgBot-0.348],[bx+0.074,S.hgBot-0.331],[bx+0.034,S.hgBot-0.331]],0.034,MATS.rubber,{z:0.165,bevel:false})); /* foot R */
+     g.add(extrude([[bx+0.034,S.hgBot-0.348],[bx+0.074,S.hgBot-0.348],[bx+0.074,S.hgBot-0.331],[bx+0.034,S.hgBot-0.331]],0.034,MATS.rubber,{z:-0.165,bevel:false})); }}, /* foot L — end of rook7 extra */
  havoc:{recL:.62,recW:.098,recTop:.075,recBot:-.050,recMat:'steel',hgL:.46,hgW:.102,hgMat:'dark',barrelOut:.44,barrelR:.024,magTilt:0,magLen:.10,magCurve:0,feedBox:1,gas:'low',
    recPts:[[-.31,.075],[.24,.075],[.305,.04],[.31,-.015],[.23,-.048],[.215,-.10],[.12,-.10],[.105,-.05],[-.03,-.052],[-.08,-.088],[-.28,-.088],[-.31,-.045]],
    hgPts:[[0,.048],[.46,.045],[.46,-.05],[0,-.055]],
@@ -1110,7 +1218,7 @@ function buildGunModel(){
   S.muzzleX=S.hgX0+S.hgL+S.barrelOut;
   S.stockX=-spec.recL/2; S.opticX=-0.02; S.gripX=S.hgX0+S.hgL*0.45; S.gripPosX=-0.10;
   S.magX=0.148; S.magTilt=spec.magTilt; S.magLen=spec.magLen; S.magCurve=spec.magCurve; S.magMat=spec.magMat;
-  S.bipodX=S.hgX0+S.hgL-0.05; S.recMatObj=MATS[spec.recMat];
+  S.bipodX=S.hgX0+S.hgL-0.05; S.recMatObj=MATS[spec.recMat]; S.stockScale=spec.stockScale||1;
   var g=new THREE.Group();
   /* receiver — extruded side profile */
   g.add(extrude(spec.recPts,spec.recW-0.008,S.recMatObj));
@@ -1162,7 +1270,7 @@ function buildGunModel(){
   }
   /* attachments */
   var mz=muzzleMesh(SLOTS[0].options[b.muzzle]); mz.position.set(S.muzzleX,0,0); g.add(mz);
-  g.add(opticMesh(SLOTS[5].options[b.optic],S));
+  if(w.id==='rook7'&&b.optic===0) g.add(rookScopeMesh(S)); else g.add(opticMesh(SLOTS[5].options[b.optic],S)); /* Rook-7: factory scope is the default optic */
   g.add(stockMesh(SLOTS[3].options[b.stock],S));
   var fgOpt=SLOTS[2].options[b.foregrip]; if(fgOpt.v!=='none') g.add(foreGripMesh(fgOpt,S));
   g.add(rearGripMesh(SLOTS[4].options[b.reargrip],S));
@@ -1676,7 +1784,7 @@ $('sndToggle').addEventListener('click',function(){
   this.textContent=soundOn?'🔊 Sound on':'🔇 Sound off';
   this.setAttribute('aria-pressed',String(soundOn));
   if(masterGain) masterGain.gain.value=soundOn?masterVol:0;
-  if(soundOn){ initAudio(); playClack(); }
+  if(soundOn){ initAudio(); playRack(); }
 });
 $('volSlider').addEventListener('input',function(){ masterVol=this.value/100; if(masterGain&&soundOn) masterGain.gain.value=masterVol; });
 $('copyCode').addEventListener('click',function(){
